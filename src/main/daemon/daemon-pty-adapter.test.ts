@@ -634,6 +634,65 @@ describe('DaemonPtyAdapter (IPtyProvider)', () => {
         true
       )
     })
+
+    it('warns when an explicit sessionId produces a new daemon session with no disk history', async () => {
+      // Why (design doc §9 post-release monitoring): the adapter emits a
+      // console.warn when a spawn with an explicit sessionId produces a
+      // brand-new daemon session AND no disk history was found. That pair
+      // is the signal that either (a) the orphan reaper ate a dir the user
+      // still wanted, or (b) the persisted mapping pointed at a session
+      // that never checkpointed. Locking the log line down here means a
+      // refactor can't silently drop the monitoring hook.
+      historyAdapter = new DaemonPtyAdapter({ socketPath, tokenPath, historyPath: historyDir })
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const sessionId = 'wt-x@@deadbeef'
+        await historyAdapter.spawn({ cols: 80, rows: 24, cwd: '/tmp', sessionId })
+        const matched = warnSpy.mock.calls.find(
+          (call) =>
+            typeof call[0] === 'string' &&
+            call[0].includes('cold-restore miss for explicit sessionId')
+        )
+        expect(matched, 'expected cold-restore-miss warn to fire').toBeDefined()
+      } finally {
+        warnSpy.mockRestore()
+      }
+    })
+
+    it('does not warn when an explicit sessionId finds existing disk history', async () => {
+      // Why: the warn must NOT fire on the happy path (persisted id +
+      // history dir present). A false-positive warn in that case would
+      // train operators to ignore the signal.
+      const sessionId = 'wt-y@@cafebabe'
+      const sessionDir = join(historyDir, getHistorySessionDirName(sessionId))
+      mkdirSync(sessionDir, { recursive: true })
+      writeFileSync(
+        join(sessionDir, 'meta.json'),
+        JSON.stringify({
+          cwd: '/tmp',
+          cols: 80,
+          rows: 24,
+          startedAt: '2026-04-15T10:00:00Z',
+          endedAt: null,
+          exitCode: null
+        })
+      )
+      writeFileSync(join(sessionDir, 'scrollback.bin'), 'prior session output')
+
+      historyAdapter = new DaemonPtyAdapter({ socketPath, tokenPath, historyPath: historyDir })
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        await historyAdapter.spawn({ cols: 80, rows: 24, sessionId })
+        const matched = warnSpy.mock.calls.find(
+          (call) =>
+            typeof call[0] === 'string' &&
+            call[0].includes('cold-restore miss for explicit sessionId')
+        )
+        expect(matched).toBeUndefined()
+      } finally {
+        warnSpy.mockRestore()
+      }
+    })
   })
 
   describe('respawn on daemon death', () => {

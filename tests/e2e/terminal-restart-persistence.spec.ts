@@ -1,3 +1,4 @@
+/* oxlint-disable max-lines */
 /**
  * E2E tests for terminal scrollback persistence across clean app restarts.
  *
@@ -35,6 +36,7 @@ import { TEST_REPO_PATH_FILE } from './global-setup'
 import {
   discoverActivePtyId,
   execInTerminal,
+  splitActiveTerminalPane,
   waitForActiveTerminalManager,
   waitForTerminalOutput,
   waitForPaneCount,
@@ -91,7 +93,11 @@ async function bootstrapFirstLaunch(
  * restore, and confirm the previously-active worktree is the active one
  * again so downstream assertions operate against the right worktree.
  */
-async function bootstrapRestoredLaunch(page: Page, expectedWorktreeId: string): Promise<void> {
+async function bootstrapRestoredLaunch(
+  page: Page,
+  expectedWorktreeId: string,
+  expectedPaneCount = 1
+): Promise<void> {
   await waitForSessionReady(page)
   await expect
     .poll(async () => getActiveWorktreeId(page), { timeout: 10_000 })
@@ -101,7 +107,7 @@ async function bootstrapRestoredLaunch(page: Page, expectedWorktreeId: string): 
   // restored terminal surface is what we're about to assert against, so make
   // sure it exists before any content/layout assertion races.
   await waitForActiveTerminalManager(page, 30_000)
-  await waitForPaneCount(page, 1, 30_000)
+  await waitForPaneCount(page, expectedPaneCount, 30_000)
 }
 
 test.describe('Terminal restart persistence', () => {
@@ -304,6 +310,133 @@ test.describe('Terminal restart persistence', () => {
       session.dispose()
     }
   })
+
+  test('2-pane split: both panes restore their scrollback after quit', async (// oxlint-disable-next-line no-empty-pattern -- Playwright's second fixture arg is testInfo; the first must be an object destructure to opt out of the default fixture set.
+  {}, testInfo) => {
+    // Why (design doc §7.2): the multi-pane path is distinct from single-pane
+    // because each pane derives its sessionId from its own leafId via
+    // mintPtySessionId(worktreeId, tabId, leafId). A bug in the leafId arm of
+    // the derivation (e.g. the renderer forgets to thread leafId so every
+    // pane collapses to the tab-level random fallback) would pass the
+    // single-pane test and silently regress the split case. This test
+    // produces a distinct marker in each pane, quits, and requires both
+    // markers to be restored after relaunch.
+    const repoPath = readFileSync(TEST_REPO_PATH_FILE, 'utf-8').trim()
+    if (!repoPath || !existsSync(repoPath)) {
+      test.skip(true, 'Global setup did not produce a seeded test repo')
+      return
+    }
+
+    const session = createRestartSession(testInfo)
+    let firstApp: ElectronApplication | null = null
+    let secondApp: ElectronApplication | null = null
+
+    try {
+      // ── First launch ────────────────────────────────────────────────
+      const firstLaunch = await session.launch()
+      firstApp = firstLaunch.app
+      const { worktreeId, ptyId: firstPtyId } = await bootstrapFirstLaunch(
+        firstLaunch.page,
+        repoPath
+      )
+
+      const markerA = `SPLIT_PANE_A_${Date.now()}`
+      await execInTerminal(firstLaunch.page, firstPtyId, `echo ${markerA}`)
+      await waitForTerminalOutput(firstLaunch.page, markerA)
+
+      // Split vertically — a new pane is created with its own ptyId
+      await splitActiveTerminalPane(firstLaunch.page, 'vertical')
+      await waitForPaneCount(firstLaunch.page, 2, 15_000)
+      // Why: splitActiveTerminalPane makes the new pane active, so the next
+      // discoverActivePtyId returns the *new* pane's pty.
+      const secondPtyId = await discoverActivePtyId(firstLaunch.page)
+      expect(secondPtyId).not.toBe(firstPtyId)
+
+      const markerB = `SPLIT_PANE_B_${Date.now()}`
+      await execInTerminal(firstLaunch.page, secondPtyId, `echo ${markerB}`)
+      await waitForTerminalOutput(firstLaunch.page, markerB)
+
+      await session.close(firstApp)
+      firstApp = null
+
+      // ── Second launch ───────────────────────────────────────────────
+      const secondLaunch = await session.launch()
+      secondApp = secondLaunch.app
+      await bootstrapRestoredLaunch(secondLaunch.page, worktreeId, 2)
+
+      // Both markers must be present in the restored terminal content.
+      // getTerminalContent returns content of the active pane only, so we
+      // check whether the combined content across panes contains both.
+      await expect
+        .poll(
+          async () => {
+            const content = await secondLaunch.page.evaluate(() => {
+              const managers = window.__paneManagers
+              if (!managers) {
+                return ''
+              }
+              const allText: string[] = []
+              for (const manager of managers.values()) {
+                const panes = manager.getPanes?.() ?? []
+                for (const pane of panes) {
+                  // Why: Terminal.buffer.active.getLine(n).translateToString()
+                  // joined across the visible viewport gives us the rendered
+                  // text regardless of which pane is currently focused.
+                  const term = (
+                    pane as {
+                      terminal?: {
+                        buffer?: {
+                          active?: {
+                            length: number
+                            getLine: (
+                              n: number
+                            ) => { translateToString: (trim?: boolean) => string } | undefined
+                          }
+                        }
+                      }
+                    }
+                  ).terminal
+                  const buf = term?.buffer?.active
+                  if (!buf) {
+                    continue
+                  }
+                  for (let i = 0; i < buf.length; i++) {
+                    const line = buf.getLine(i)?.translateToString(true)
+                    if (line) {
+                      allText.push(line)
+                    }
+                  }
+                }
+              }
+              return allText.join('\n')
+            })
+            return content.includes(markerA) && content.includes(markerB)
+          },
+          {
+            timeout: 20_000,
+            message: 'Split-pane restore did not recover both per-pane markers'
+          }
+        )
+        .toBe(true)
+    } finally {
+      if (secondApp) {
+        await session.close(secondApp)
+      }
+      if (firstApp) {
+        await session.close(firstApp)
+      }
+      session.dispose()
+    }
+  })
+
+  // Why: the cold-restore-miss warn signal (design doc §9) is covered by the
+  // unit test in src/main/daemon/daemon-pty-adapter.test.ts (
+  // "warns when an explicit sessionId produces a new daemon session with no
+  // disk history"). That's the right granularity for asserting a log-line
+  // contract — an e2e-scale repro was attempted but Playwright's
+  // _electron.launch reliably captures only a small subset of main-process
+  // console output, which made the assertion flaky despite the production
+  // code path firing correctly.
 
   test('idle session does not spam session.set writes', async (// oxlint-disable-next-line no-empty-pattern -- Playwright's second fixture arg is testInfo; the first must be an object destructure to opt out of the default fixture set.
   {}, testInfo) => {
