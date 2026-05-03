@@ -186,6 +186,21 @@ export class DaemonPtyAdapter implements IPtyProvider {
     }
 
     if (this.historyManager && result.isNew) {
+      // Why (design doc §9 post-release monitoring): a spawn with an explicit
+      // sessionId that produced a brand-new daemon session AND has no disk
+      // history is the signal that either (a) the reaper ate a dir the user
+      // still wanted, or (b) the persisted mapping pointed at a session that
+      // never wrote a checkpoint. This shouldn't happen under the defensive
+      // keep-set derivation — if it starts showing up in logs, investigate
+      // before the next release.
+      if (opts.sessionId !== undefined && !restoreInfo) {
+        console.warn('[pty] cold-restore miss for explicit sessionId — no disk history found', {
+          sessionId,
+          worktreeId: opts.worktreeId,
+          tabId: opts.tabId,
+          leafId: opts.leafId
+        })
+      }
       void this.historyManager
         .openSession(sessionId, {
           cwd: effectiveCwd ?? '',

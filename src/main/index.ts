@@ -526,12 +526,18 @@ app.whenReady().then(async () => {
         liveDaemonSessionIds.add(id)
       }
     }
-    await runOrphanHistoryReaper({
+    const reapStats = await runOrphanHistoryReaper({
       historyBasePath: getHistoryDir(),
       sidecarDir: app.getPath('userData'),
       workspaceSession: store.getWorkspaceSession(),
       liveDaemonSessionIds
     })
+    // Why (design doc §9): log counts so post-release we can tell whether
+    // the reaper is firing at all and whether the three gates (keep set,
+    // mtime grace, quarantine) are in their expected ratios. Persistent
+    // non-zero `reaped` without corresponding shrinkage of history dirs in
+    // the wild would indicate a logic bug worth investigating.
+    console.log('[history-reaper] startup pass stats:', reapStats)
   } catch (error) {
     console.warn('[history-reaper] startup pass failed:', error)
   }

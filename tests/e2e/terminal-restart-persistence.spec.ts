@@ -27,7 +27,8 @@
  *     removed periodic save represented.
  */
 
-import { readFileSync, existsSync } from 'fs'
+import { readFileSync, writeFileSync, existsSync } from 'fs'
+import { join } from 'path'
 import type { ElectronApplication, Page } from '@stablyai/playwright-test'
 import { test, expect } from './helpers/orca-app'
 import { TEST_REPO_PATH_FILE } from './global-setup'
@@ -216,6 +217,83 @@ test.describe('Terminal restart persistence', () => {
           timeout: 10_000
         })
         .toBe(tabsBefore.length)
+    } finally {
+      if (secondApp) {
+        await session.close(secondApp)
+      }
+      if (firstApp) {
+        await session.close(firstApp)
+      }
+      session.dispose()
+    }
+  })
+
+  test('scrollback survives quit with missing ptyId (Issue #217 regression)', async (// oxlint-disable-next-line no-empty-pattern -- Playwright's second fixture arg is testInfo; the first must be an object destructure to opt out of the default fixture set.
+  {}, testInfo) => {
+    // Why (design doc §7.2): this is the load-bearing test for the
+    // deterministic-sessionId fix. Issue #217 failed specifically when
+    // orca-data.json's `ptyId` field was empty at restore time (the
+    // SIGKILL-between-spawn-and-persist window). Before the fix, the
+    // renderer had no way to reach the on-disk history dir without that
+    // field. After the fix, mintPtySessionId(worktreeId, tabId, leafId)
+    // reproduces the same id, so the cold-restore reader finds the dir
+    // anyway. We simulate the race here by mutating the persisted
+    // orca-data.json between launches — deleting the ptyId field gives
+    // us the exact state the old code couldn't recover from, without
+    // the flakiness of racing a real SIGKILL.
+    const repoPath = readFileSync(TEST_REPO_PATH_FILE, 'utf-8').trim()
+    if (!repoPath || !existsSync(repoPath)) {
+      test.skip(true, 'Global setup did not produce a seeded test repo')
+      return
+    }
+
+    const session = createRestartSession(testInfo)
+    let firstApp: ElectronApplication | null = null
+    let secondApp: ElectronApplication | null = null
+
+    try {
+      // ── First launch: produce scrollback, let clean quit flush state ──
+      const firstLaunch = await session.launch()
+      firstApp = firstLaunch.app
+      const { worktreeId, ptyId } = await bootstrapFirstLaunch(firstLaunch.page, repoPath)
+
+      const marker = `DETERMINISTIC_RESTORE_${Date.now()}`
+      await execInTerminal(firstLaunch.page, ptyId, `echo ${marker}`)
+      await waitForTerminalOutput(firstLaunch.page, marker)
+
+      await session.close(firstApp)
+      firstApp = null
+
+      // Simulate the SIGKILL-before-persist race: strip ptyId from every
+      // tab in the persisted session. The terminal-history/ dir stays on
+      // disk (it was written by the daemon's checkpoint tick, not by
+      // orca-data.json). Pre-fix code would fail to find it; post-fix
+      // code re-derives the id from (worktreeId, tabId, leafId) and
+      // hits the same directory.
+      const dataFile = join(session.userDataDir, 'orca-data.json')
+      const data = JSON.parse(readFileSync(dataFile, 'utf-8')) as {
+        workspaceSession?: {
+          tabsByWorktree?: Record<string, { ptyId: string | null }[]>
+        }
+      }
+      const tabs = data.workspaceSession?.tabsByWorktree?.[worktreeId] ?? []
+      for (const tab of tabs) {
+        tab.ptyId = null
+      }
+      writeFileSync(dataFile, JSON.stringify(data))
+
+      // ── Second launch: deterministic path must recover scrollback ────
+      const secondLaunch = await session.launch()
+      secondApp = secondLaunch.app
+      await bootstrapRestoredLaunch(secondLaunch.page, worktreeId)
+
+      await expect
+        .poll(async () => (await getTerminalContent(secondLaunch.page)).includes(marker), {
+          timeout: 15_000,
+          message:
+            'Deterministic-sessionId restore did not recover scrollback when ptyId was missing'
+        })
+        .toBe(true)
     } finally {
       if (secondApp) {
         await session.close(secondApp)
