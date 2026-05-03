@@ -53,17 +53,28 @@ export function mintPtySessionId(worktreeId?: string, tabId?: string, leafId?: s
     return randomUUID()
   }
   if (tabId && leafId) {
-    // Why: NUL separator is belt-and-suspenders. `createHash.update()` is
-    // streaming so `update("a") + update("\0") + update("b")` and
-    // `update("a\0b")` produce identical digests; the explicit separator
-    // is cosmetic against today's NUL-free input alphabet (tabIds are
-    // `crypto.randomUUID()`, leafIds are `pane:<number>`). Callers that
-    // might introduce NUL-containing inputs must switch to a
-    // length-prefixed encoding instead.
+    // Why: length-prefix each field before hashing so (tabId, leafId)
+    // pairs that concatenate to the same byte string but differ in where
+    // the boundary falls still produce distinct digests. A plain NUL
+    // separator is NOT sufficient — `hash("a\0b" + "\0" + "c")` equals
+    // `hash("a" + "\0" + "b\0c")` because `createHash.update` is a
+    // streaming append. Today's inputs (tabIds are `crypto.randomUUID()`,
+    // leafIds are `pane:<number>`) never contain NUL, so the practical
+    // risk is zero — but the design doc §7.1 calls out this property
+    // explicitly, and length-prefixing is the cheapest unambiguous
+    // encoding that doesn't rely on an input-alphabet invariant we'd
+    // have to re-verify every time a caller changes.
+    const tabBuf = Buffer.from(tabId, 'utf8')
+    const leafBuf = Buffer.from(leafId, 'utf8')
+    const tabLen = Buffer.alloc(4)
+    tabLen.writeUInt32BE(tabBuf.length, 0)
+    const leafLen = Buffer.alloc(4)
+    leafLen.writeUInt32BE(leafBuf.length, 0)
     const h = createHash('sha256')
-    h.update(tabId)
-    h.update('\0')
-    h.update(leafId)
+    h.update(tabLen)
+    h.update(tabBuf)
+    h.update(leafLen)
+    h.update(leafBuf)
     const suffix = h.digest('hex').slice(0, 8)
     return `${worktreeId}@@${suffix}`
   }

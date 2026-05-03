@@ -64,6 +64,44 @@ describe('mintPtySessionId', () => {
     const b = mintPtySessionId('wt-alpha', 'tab-xyz', undefined)
     expect(a).not.toBe(b)
   })
+
+  it('distinguishes (tabId="a\\0b", leafId="c") from (tabId="a", leafId="b\\0c")', () => {
+    // Why: the design doc §7.1 calls this out explicitly. A plain NUL
+    // separator is insufficient because `hash("a\0b" + "\0" + "c")`
+    // equals `hash("a" + "\0" + "b\0c")` — the mint uses length-prefixed
+    // encoding so the boundary between tabId and leafId is recoverable
+    // from the byte stream. Losing this distinction would collapse two
+    // distinct panes onto one history dir.
+    const a = mintPtySessionId('wt-alpha', 'a\x00b', 'c')
+    const b = mintPtySessionId('wt-alpha', 'a', 'b\x00c')
+    expect(a).not.toBe(b)
+  })
+
+  it('distinguishes siblings that concat to the same string via length prefix', () => {
+    // Why: the primary correctness guarantee of length-prefix encoding.
+    // ("ab", "cd") and ("a", "bcd") both produce the byte string "abcd"
+    // if you just concatenate; with length-prefixed hashing they must
+    // still hash differently.
+    const a = mintPtySessionId('wt-alpha', 'ab', 'cd')
+    const b = mintPtySessionId('wt-alpha', 'a', 'bcd')
+    expect(a).not.toBe(b)
+  })
+
+  it('has zero collisions across 1000 sibling (tabId, leafId) pairs', () => {
+    // Why: 8 hex chars = 32 bits ≈ 1 in 4B per pair; with 1000 pairs the
+    // birthday-paradox expected collisions is <<1. A collision here means
+    // our hash implementation is broken (e.g. truncating before hashing),
+    // not just an unlucky draw.
+    const seen = new Set<string>()
+    for (let t = 0; t < 100; t++) {
+      for (let p = 0; p < 10; p++) {
+        const id = mintPtySessionId('wt-alpha', `tab-${t}`, `pane:${p}`)
+        expect(seen.has(id)).toBe(false)
+        seen.add(id)
+      }
+    }
+    expect(seen.size).toBe(1000)
+  })
 })
 
 describe('mintPtySessionIdWithOrigin', () => {
