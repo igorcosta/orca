@@ -1,3 +1,7 @@
+/* eslint-disable max-lines -- Why: PaneManager owns the DOM, WebGL,
+drag-reorder, and counter-advance state for the terminal-pane tree. Splitting
+further would scatter invariants (active pane focus, nextPaneId monotonicity,
+divider styles) across files with no cleaner ownership seam. */
 import type {
   PaneManagerOptions,
   PaneStyleOptions,
@@ -60,6 +64,15 @@ export class PaneManager {
     this.root = root
     this.options = options
     this.renderingSuspended = options.initialRenderingSuspended === true
+  }
+
+  // Why: nextPaneId resets to 1 on restart; persisted pane:N leafIds are
+  // replayed verbatim. Bumping past max(N) prevents the next split from
+  // colliding — otherwise two panes derive the same deterministic history dir.
+  advanceNextPaneIdTo(minNextId: number): void {
+    if (minNextId > this.nextPaneId) {
+      this.nextPaneId = minNextId
+    }
   }
 
   createInitialPane(opts?: { focus?: boolean }): ManagedPane {

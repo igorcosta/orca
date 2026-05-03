@@ -283,6 +283,43 @@ export function restoreScrollbackBuffers(
   }
 }
 
+/**
+ * Why: the snapshot stores leafIds as `pane:<N>` strings rewritten verbatim
+ * on restore. After replay we must advance PaneManager.nextPaneId past
+ * `max(N)` so the next user-triggered split does not mint a pane whose
+ * `paneLeafId` collides with a persisted leaf — a collision would collapse
+ * the determinism of sessionIds derived from `(worktreeId, tabId, leafId)`.
+ *
+ * Parser: `/^pane:(\d+)$/`. Non-matching entries (e.g. a legacy custom
+ * leafId shape, or a corrupted snapshot) are skipped rather than thrown
+ * on — the counter advance is a best-effort safety; if the highest
+ * numeric leaf is missed we fall back to the per-instance monotonic
+ * default, which at worst surfaces the original collision bug, not a
+ * new crash.
+ */
+function highestPaneNInSnapshot(node: TerminalPaneLayoutNode | null | undefined): number {
+  if (!node) {
+    return 0
+  }
+  let max = 0
+  const visit = (n: TerminalPaneLayoutNode): void => {
+    if (n.type === 'leaf') {
+      const match = /^pane:(\d+)$/.exec(n.leafId)
+      if (match) {
+        const parsed = Number(match[1])
+        if (Number.isFinite(parsed) && parsed > max) {
+          max = parsed
+        }
+      }
+      return
+    }
+    visit(n.first)
+    visit(n.second)
+  }
+  visit(node)
+  return max
+}
+
 export function replayTerminalLayout(
   manager: PaneManager,
   snapshot: TerminalLayoutSnapshot | null | undefined,
@@ -315,5 +352,11 @@ export function replayTerminalLayout(
   }
 
   restoreNode(snapshot.root, initialPane.id)
+
+  // Why: bump PaneManager's counter past the highest persisted `pane:N`
+  // before any user-triggered split runs. See highestPaneNInSnapshot.
+  const maxPersisted = highestPaneNInSnapshot(snapshot.root)
+  manager.advanceNextPaneIdTo(maxPersisted + 1)
+
   return paneByLeafId
 }
