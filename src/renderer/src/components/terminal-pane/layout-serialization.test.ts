@@ -1,3 +1,6 @@
+/* oxlint-disable max-lines -- Why: layout-serialization concentrates the
+replay/snapshot/fallback-font logic and its regressions are easiest to
+catch together. */
 import { describe, expect, it, beforeAll } from 'vitest'
 import type { TerminalPaneLayoutNode } from '../../../../shared/types'
 
@@ -39,8 +42,10 @@ import {
   serializeTerminalLayout,
   EMPTY_LAYOUT,
   collectLeafIdsInOrder,
-  collectLeafIdsInReplayCreationOrder
+  collectLeafIdsInReplayCreationOrder,
+  replayTerminalLayout
 } from './layout-serialization'
+import type { PaneManager } from '@/lib/pane-manager/pane-manager'
 
 // ---------------------------------------------------------------------------
 // Helper to create mock elements
@@ -298,5 +303,133 @@ describe('collectLeafIdsInReplayCreationOrder', () => {
     }
 
     expect(collectLeafIdsInReplayCreationOrder(layout)).toEqual(['A', 'B', 'C'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// replayTerminalLayout — pane-counter advance
+// ---------------------------------------------------------------------------
+/**
+ * Why: a persisted layout stores leafIds as `pane:<N>` verbatim. After replay
+ * the PaneManager's monotonic counter (a per-instance `nextPaneId` that
+ * resets to 1 on each app start) must be advanced past max(N) so the next
+ * user-triggered split does not mint a pane whose `paneLeafId` collides with
+ * an existing persisted leaf. Collision would collapse the determinism of
+ * session ids derived from `(worktreeId, tabId, leafId)` — two distinct panes
+ * sharing one history directory. Covered by tests below.
+ */
+
+function createMockPaneManager(): {
+  manager: PaneManager
+  createdIds: number[]
+  advanceCalls: number[]
+  // How the mock simulates the real counter. On createInitialPane / splitPane
+  // we hand out `nextId++`; advanceNextPaneIdTo bumps the counter forward.
+  nextId: () => number
+} {
+  let counter = 1
+  const created: number[] = []
+  const advances: number[] = []
+
+  const mintPane = (): { id: number } => {
+    const id = counter++
+    created.push(id)
+    return { id }
+  }
+
+  const manager = {
+    createInitialPane: ({ focus }: { focus?: boolean } = {}) => {
+      void focus
+      return mintPane()
+    },
+    splitPane: () => mintPane(),
+    advanceNextPaneIdTo: (minNextId: number) => {
+      advances.push(minNextId)
+      if (minNextId > counter) {
+        counter = minNextId
+      }
+    }
+    // Why: we cast through unknown because the mock only implements the
+    // narrow surface replayTerminalLayout actually calls. Keeps the test
+    // from having to stand up WebGL/DOM dependencies.
+  } as unknown as PaneManager
+
+  return {
+    manager,
+    createdIds: created,
+    advanceCalls: advances,
+    nextId: () => counter
+  }
+}
+
+describe('replayTerminalLayout — pane counter advance', () => {
+  it('bumps the counter past the highest persisted pane:N', () => {
+    // Why: persisted leafIds can encode panes with N higher than what the
+    // replay itself mints (e.g. the user closed pane 2 and then split
+    // pane 5 before shutdown — the snapshot still contains pane:5 but
+    // only 3 panes end up replayed). The counter must reach max(N)+1.
+    const { manager, advanceCalls, nextId } = createMockPaneManager()
+    const snapshot = {
+      root: {
+        type: 'split' as const,
+        direction: 'vertical' as const,
+        first: { type: 'leaf' as const, leafId: 'pane:7' },
+        second: { type: 'leaf' as const, leafId: 'pane:3' }
+      },
+      activeLeafId: null,
+      expandedLeafId: null
+    }
+
+    replayTerminalLayout(manager, snapshot, false)
+
+    // highest persisted N is 7; counter must be advanced to >= 8.
+    expect(advanceCalls).toEqual([8])
+    expect(nextId()).toBeGreaterThanOrEqual(8)
+  })
+
+  it('does not regress the counter when the highest persisted N is small', () => {
+    const { manager, advanceCalls } = createMockPaneManager()
+    const snapshot = {
+      root: { type: 'leaf' as const, leafId: 'pane:1' },
+      activeLeafId: null,
+      expandedLeafId: null
+    }
+
+    replayTerminalLayout(manager, snapshot, false)
+
+    // advanceNextPaneIdTo(2) is called but has no effect if the counter
+    // is already >= 2 — in the mock `createInitialPane` minted id 1 and
+    // left the counter at 2 so this is a no-op move, which the mock
+    // ignores (the real implementation's guard matches).
+    expect(advanceCalls).toEqual([2])
+  })
+
+  it('skips non-matching leaf ids without throwing', () => {
+    // Why: a corrupted or legacy snapshot might contain leafIds that
+    // don't match `pane:<N>`. These must be skipped rather than crash
+    // the restore — the counter fix is a best-effort safety valve.
+    const { manager, advanceCalls } = createMockPaneManager()
+    const snapshot = {
+      root: {
+        type: 'split' as const,
+        direction: 'vertical' as const,
+        first: { type: 'leaf' as const, leafId: 'legacy-shape-123' },
+        second: { type: 'leaf' as const, leafId: 'pane:4' }
+      },
+      activeLeafId: null,
+      expandedLeafId: null
+    }
+
+    replayTerminalLayout(manager, snapshot, false)
+
+    expect(advanceCalls).toEqual([5])
+  })
+
+  it('advances to 1 (a no-op) when the snapshot has no persisted panes', () => {
+    const { manager, advanceCalls } = createMockPaneManager()
+    replayTerminalLayout(manager, { root: null, activeLeafId: null, expandedLeafId: null }, false)
+    // Snapshot has no root → replayTerminalLayout returns early, before
+    // the advance call path. Assert no advance was issued.
+    expect(advanceCalls).toEqual([])
   })
 })
