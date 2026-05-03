@@ -436,12 +436,25 @@ export function connectPanePty(
     // has no equivalent mechanism, so the renderer must inject it via sendInput.
     let pendingStartupCommand = connectionId ? (paneStartup?.command ?? null) : null
 
+    // Why: this must match the leafId the persistence layer uses for
+    // terminalLayoutsByTabId[tabId].ptyIdsByLeafId so a restart reaches
+    // the same history directory. `restoredLeafId` wins when the pane
+    // was materialized from a persisted snapshot (replayTerminalLayout
+    // preserved it); otherwise the newly-assigned paneId is the leaf.
+    const effectiveLeafId = deps.restoredLeafId ?? paneLeafId(pane.id)
+
     const startFreshSpawn = (): void => {
       const spawnPromise = Promise.resolve(
         transport.connect({
           url: '',
           cols,
           rows,
+          // Why: threading tabId/leafId lets the main process derive a
+          // deterministic sessionId (see src/main/daemon/pty-session-id.ts)
+          // so cold-restore works even if the renderer was SIGKILLed
+          // before its debounced ptyId persistence ran.
+          tabId: deps.tabId,
+          leafId: effectiveLeafId,
           callbacks: {
             onData: dataCallback,
             onReplayData: replayDataCallback,
@@ -744,6 +757,12 @@ export function connectPanePty(
         cols,
         rows,
         sessionId: deferredReattachSessionId,
+        // Why: tabId/leafId are ignored when sessionId is explicit, but
+        // threading them keeps the audit trail intact and makes a future
+        // fallback (e.g. the explicit id was invalid) produce a
+        // deterministic id instead of a random one.
+        tabId: deps.tabId,
+        leafId: effectiveLeafId,
         callbacks: {
           onData: dataCallback,
           onReplayData: replayDataCallback,

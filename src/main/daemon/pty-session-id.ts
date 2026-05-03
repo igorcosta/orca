@@ -1,18 +1,104 @@
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { isAbsolute, join, relative, resolve, sep } from 'path'
 
+export type MintedSessionIdOrigin = 'deterministic' | 'explicit' | 'random-fallback'
+
+export type MintSessionIdResult = {
+  sessionId: string
+  /**
+   * How the id was produced:
+   *  - `deterministic`: derived from (worktreeId, tabId, leafId) — the happy
+   *    path that lets cold-restore survive a crash before persistence.
+   *  - `explicit`: caller supplied a pre-computed sessionId (reattach path).
+   *  - `random-fallback`: a daemon-host spawn did not receive tabId/leafId
+   *    and had to fall back to a random UUID. Persistence still matters for
+   *    this branch — it is the old behavior and re-exposes the race this
+   *    design is trying to close. Logged at warn level so regressions in
+   *    the renderer plumbing surface loudly.
+   */
+  derivedFrom: MintedSessionIdOrigin
+}
+
 /**
- * Session IDs use the format `${worktreeId}@@${shortUuid}` so that
+ * Session IDs use the format `${worktreeId}@@${suffix}` so that
  * DaemonPtyAdapter.reconcileOnStartup (see daemon-pty-adapter.ts) can
  * derive the owning worktree by splitting on the @@ separator.
  *
- * Both pty.ts (host-daemon spawn path) and DaemonPtyAdapter.doSpawn
- * (fallback when opts.sessionId is absent) must use this helper — a
- * drifted format would break cold-restore mapping and Pi overlay
+ * Deterministic suffix (preferred): when both `tabId` and `leafId` are
+ * provided, the suffix is the first 32 bits of SHA-256(tabId || "\0" ||
+ * leafId), hex-encoded. This lets a restart reach the same history
+ * directory for the same (worktreeId, tabId, leafId) triple *without*
+ * needing `orca-data.json` to have persisted the sessionId — closing
+ * the SIGKILL-between-spawn-and-persist race that Issue #217 describes.
+ *
+ * Random suffix (fallback): when tabId/leafId are absent (e.g. an older
+ * non-pane caller) the suffix is `randomUUID().slice(0, 8)`. This is the
+ * legacy behavior; the renderer is expected to thread tabId+leafId for
+ * every daemon-host spawn, so falling in here from a daemon-host code
+ * path indicates a plumbing bug and is logged at warn level by callers.
+ *
+ * Both `pty.ts` (host-daemon spawn path) and DaemonPtyAdapter.doSpawn
+ * (fallback when opts.sessionId is absent) delegate to this helper —
+ * a drifted format would break cold-restore mapping and Pi overlay
  * keying.
+ *
+ * Collision bound: with 32 bits of suffix entropy, the birthday bound
+ * for two distinct (tabId, leafId) pairs colliding within one worktree
+ * is ~1 in 2^16 at ~256 pairs. Real worktrees hold O(10) panes. The
+ * bound matches the pre-existing random-UUID path (also 32 bits) — no
+ * regression.
  */
-export function mintPtySessionId(worktreeId?: string): string {
-  return worktreeId ? `${worktreeId}@@${randomUUID().slice(0, 8)}` : randomUUID()
+export function mintPtySessionId(worktreeId?: string, tabId?: string, leafId?: string): string {
+  if (!worktreeId) {
+    return randomUUID()
+  }
+  if (tabId && leafId) {
+    // Why: NUL separator is belt-and-suspenders. `createHash.update()` is
+    // streaming so `update("a") + update("\0") + update("b")` and
+    // `update("a\0b")` produce identical digests; the explicit separator
+    // is cosmetic against today's NUL-free input alphabet (tabIds are
+    // `crypto.randomUUID()`, leafIds are `pane:<number>`). Callers that
+    // might introduce NUL-containing inputs must switch to a
+    // length-prefixed encoding instead.
+    const h = createHash('sha256')
+    h.update(tabId)
+    h.update('\0')
+    h.update(leafId)
+    const suffix = h.digest('hex').slice(0, 8)
+    return `${worktreeId}@@${suffix}`
+  }
+  return `${worktreeId}@@${randomUUID().slice(0, 8)}`
+}
+
+/**
+ * Variant that also reports how the id was produced. Use this at the
+ * single mint call site in `ipc/pty.ts` so the observability log can
+ * split info vs. warn appropriately.
+ */
+export function mintPtySessionIdWithOrigin(args: {
+  worktreeId?: string
+  tabId?: string
+  leafId?: string
+  explicitSessionId?: string
+}): MintSessionIdResult {
+  if (args.explicitSessionId) {
+    return { sessionId: args.explicitSessionId, derivedFrom: 'explicit' }
+  }
+  if (args.worktreeId && args.tabId && args.leafId) {
+    return {
+      sessionId: mintPtySessionId(args.worktreeId, args.tabId, args.leafId),
+      derivedFrom: 'deterministic'
+    }
+  }
+  // Either worktreeId is absent (non-daemon spawn — we return a raw uuid
+  // and the caller is responsible for deciding whether that's expected)
+  // or tabId/leafId weren't threaded through from the renderer. The
+  // second case is the one we want to hear about; callers differentiate
+  // on `!!args.worktreeId` before choosing the log level.
+  return {
+    sessionId: mintPtySessionId(args.worktreeId, args.tabId, args.leafId),
+    derivedFrom: 'random-fallback'
+  }
 }
 
 /**

@@ -14,7 +14,7 @@ import { piTitlebarExtensionService } from '../pi/titlebar-extension-service'
 import { isPwshAvailable } from '../pwsh'
 import { LocalPtyProvider } from '../providers/local-pty-provider'
 import type { IPtyProvider, PtySpawnOptions, PtySpawnResult } from '../providers/types'
-import { mintPtySessionId, isSafePtySessionId } from '../daemon/pty-session-id'
+import { mintPtySessionIdWithOrigin, isSafePtySessionId } from '../daemon/pty-session-id'
 import type { ClaudeRuntimeAuthPreparation } from '../claude-accounts/runtime-auth-service'
 import { CLAUDE_AUTH_ENV_VARS, hasClaudeAuthEnvConflict } from '../claude-accounts/environment'
 import {
@@ -551,6 +551,13 @@ export function registerPtyHandlers(
         worktreeId?: string
         sessionId?: string
         shellOverride?: string
+        // Why: renderer threads tabId + leafId for every daemon-host spawn so
+        // the main process can mint a deterministic sessionId from
+        // (worktreeId, tabId, leafId). That makes cold-restore survive a
+        // SIGKILL between spawn and the renderer's debounced persistence.
+        // Both fields are optional for back-compat with non-pane callers.
+        tabId?: string
+        leafId?: string
       }
     ) => {
       const provider = getProvider(args.connectionId)
@@ -600,8 +607,40 @@ export function registerPtyHandlers(
       // an existing PTY whose state (OpenCode hooks, Pi overlay, agent-hook
       // pane caches) we must not clobber on a retry/attach failure.
       const isMintedSessionId = args.sessionId === undefined && isDaemonHostSpawn
-      const effectiveSessionId =
-        args.sessionId ?? (isDaemonHostSpawn ? mintPtySessionId(args.worktreeId) : undefined)
+      // Why: mint deterministically from (worktreeId, tabId, leafId) when
+      // the renderer threads those. Explicit sessionIds (reattach) and
+      // random-fallback (tabId/leafId missing) are recorded so we can
+      // spot renderer plumbing regressions in the logs.
+      const mintResult = isDaemonHostSpawn
+        ? mintPtySessionIdWithOrigin({
+            worktreeId: args.worktreeId,
+            tabId: args.tabId,
+            leafId: args.leafId,
+            explicitSessionId: args.sessionId
+          })
+        : args.sessionId
+          ? { sessionId: args.sessionId, derivedFrom: 'explicit' as const }
+          : null
+      const effectiveSessionId = mintResult?.sessionId
+      if (mintResult && isDaemonHostSpawn) {
+        const logPayload = {
+          worktreeId: args.worktreeId,
+          tabId: args.tabId,
+          leafId: args.leafId,
+          sessionId: mintResult.sessionId,
+          derivedFrom: mintResult.derivedFrom
+        }
+        if (mintResult.derivedFrom === 'random-fallback') {
+          // Why: a daemon-host spawn arriving without tabId/leafId means the
+          // renderer plumbing didn't thread them — cold restore will only
+          // survive if the renderer later persists this sessionId before a
+          // crash. That's exactly the race Issue #217 documented, so surface
+          // it as a warning.
+          console.warn('[pty] mintPtySessionId random-fallback', logPayload)
+        } else {
+          console.info('[pty] mintPtySessionId', logPayload)
+        }
+      }
       const baseEnv = claudeAuth ? { ...args.env, ...claudeAuth.envPatch } : args.env
       let env: Record<string, string> | undefined = baseEnv
       const preAllocatedHandle =
@@ -672,6 +711,15 @@ export function registerPtyHandlers(
       }
       if (effectiveSessionId !== undefined) {
         spawnOptions.sessionId = effectiveSessionId
+      }
+      // Why: forward tabId/leafId to the provider so any fallback mint path
+      // inside the adapter (tests, direct callers) can still produce a
+      // deterministic id.
+      if (args.tabId !== undefined) {
+        spawnOptions.tabId = args.tabId
+      }
+      if (args.leafId !== undefined) {
+        spawnOptions.leafId = args.leafId
       }
       // Why: on Windows, fall back to the persisted default-shell setting
       // when the renderer didn't send a per-tab override. Without this, the

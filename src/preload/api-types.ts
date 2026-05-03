@@ -411,6 +411,12 @@ export type PreloadApi = {
       // Preserved from the deleted index.d.ts PtyApi duplicate during the
       // single-source-of-truth collapse (see docs/preload-typecheck-hole.md §1).
       shellOverride?: string
+      // Why: renderer threads these for daemon-host spawns so the main
+      // process can mint a deterministic sessionId from (worktreeId,
+      // tabId, leafId). Closes the SIGKILL-between-spawn-and-persist race
+      // that lost terminal scrollback on unclean restart (Issue #217).
+      tabId?: string
+      leafId?: string
     }) => Promise<{
       id: string
       snapshot?: string

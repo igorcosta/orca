@@ -96,7 +96,14 @@ export class DaemonPtyAdapter implements IPtyProvider {
   private async doSpawn(opts: PtySpawnOptions): Promise<PtySpawnResult> {
     await this.ensureConnected()
 
-    const sessionId = opts.sessionId ?? mintPtySessionId(opts.worktreeId)
+    // Why: the renderer should thread tabId/leafId for every daemon-host
+    // spawn so we get a deterministic sessionId. On the main-process
+    // spawn path, `ipc/pty.ts` has already minted `opts.sessionId` with
+    // the deterministic suffix — we arrive here via opts.sessionId in
+    // the common case. This fallback handles direct callers (tests,
+    // non-IPC code paths) that don't pre-mint; they should still pass
+    // tabId/leafId when possible so the id is stable across restarts.
+    const sessionId = opts.sessionId ?? mintPtySessionId(opts.worktreeId, opts.tabId, opts.leafId)
 
     if (this.killedSessionTombstones.has(sessionId)) {
       throw new TerminalKilledError(sessionId)

@@ -25,6 +25,15 @@ export type PtySpawnOptions = {
   /** Daemon session ID for reattach. When provided, the daemon reconnects
    *  to an existing session instead of creating a new one. */
   sessionId?: string
+  /** Tab identity, forwarded by the renderer for daemon-host spawns so the
+   *  main process can derive a deterministic sessionId from
+   *  (worktreeId, tabId, leafId). Closes the SIGKILL-between-spawn-and-
+   *  persist race that loses scrollback on unclean restart. Optional for
+   *  backwards compatibility with non-pane callers; when absent the daemon
+   *  path falls back to a random-suffix sessionId and logs at warn level. */
+  tabId?: string
+  /** Pane leaf identity (e.g. "pane:1"). See `tabId` for why. */
+  leafId?: string
   /** Why: allows the renderer to request a specific shell for a single new
    *  terminal tab (e.g. "open this tab in WSL" from the "+" submenu) without
    *  changing the user's persistent default shell setting. Only consulted on

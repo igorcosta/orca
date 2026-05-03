@@ -353,7 +353,12 @@ export function createIpcPtyTransport(opts: IpcPtyTransportOptions = {}): PtyTra
           ...(connectionId ? { connectionId } : {}),
           ...(options.sessionId ? { sessionId: options.sessionId } : {}),
           worktreeId,
-          ...(shellOverride ? { shellOverride } : {})
+          ...(shellOverride ? { shellOverride } : {}),
+          // Why: thread tabId/leafId so the main process can derive a
+          // deterministic sessionId. Issue #217 regression prevention —
+          // see pty-session-id.ts.
+          ...(options.tabId ? { tabId: options.tabId } : {}),
+          ...(options.leafId ? { leafId: options.leafId } : {})
         })
         const spawnResult = result as PtyConnectResult & { isReattach?: boolean }
 

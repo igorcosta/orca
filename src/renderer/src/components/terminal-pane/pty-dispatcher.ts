@@ -153,6 +153,13 @@ export type PtyTransport = {
     /** Daemon session ID for reattach. When provided, the daemon reconnects
      *  to an existing session instead of creating a new one. */
     sessionId?: string
+    /** Tab identity, forwarded with every daemon-host spawn so the main
+     *  process can mint a deterministic sessionId from (worktreeId, tabId,
+     *  leafId). Closes the SIGKILL-between-spawn-and-persist race that
+     *  lost terminal scrollback on unclean restart (Issue #217). */
+    tabId?: string
+    /** Pane leaf identity (e.g. "pane:1"). See `tabId` for why. */
+    leafId?: string
     callbacks: {
       onConnect?: () => void
       onDisconnect?: () => void
