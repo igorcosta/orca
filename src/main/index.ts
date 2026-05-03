@@ -11,7 +11,14 @@ import { StatsCollector, initStatsPath } from './stats/collector'
 import { ClaudeUsageStore, initClaudeUsagePath } from './claude-usage/store'
 import { CodexUsageStore, initCodexUsagePath } from './codex-usage/store'
 import { killAllPty } from './ipc/pty'
-import { initDaemonPtyProvider, disconnectDaemon } from './daemon/daemon-init'
+import {
+  initDaemonPtyProvider,
+  disconnectDaemon,
+  getDaemonProvider,
+  getHistoryDir
+} from './daemon/daemon-init'
+import { runOrphanHistoryReaper } from './daemon/orphan-history-reaper'
+import { DaemonPtyRouter } from './daemon/daemon-pty-router'
 import { setAppRuntimeFlags } from './ipc/app'
 import { closeAllWatchers } from './ipc/filesystem-watcher'
 import { registerCoreHandlers } from './ipc/register-core-handlers'
@@ -495,6 +502,38 @@ app.whenReady().then(async () => {
     await initDaemonPtyProvider()
   } catch (error) {
     console.error('[daemon] Failed to start daemon PTY provider, falling back to local:', error)
+  }
+  // Why: with deterministic session ids the `terminal-history/` tree no
+  // longer self-cleans when the persisted keep set misses an id — a pane
+  // closed permanently before its workspace-session update landed would
+  // leak a dir forever. Run a conservative (30-day mtime grace +
+  // two-launch quarantine) orphan reaper once per boot, sibling to
+  // daemon init. Best-effort: a failure here must never block startup.
+  try {
+    const provider = getDaemonProvider()
+    const liveDaemonSessionIds = new Set<string>()
+    if (provider instanceof DaemonPtyRouter) {
+      for (const id of provider.getCurrentAdapter().getActiveSessionIds()) {
+        liveDaemonSessionIds.add(id)
+      }
+      for (const legacy of provider.getLegacyAdapters()) {
+        for (const id of legacy.getActiveSessionIds()) {
+          liveDaemonSessionIds.add(id)
+        }
+      }
+    } else if (provider) {
+      for (const id of provider.getActiveSessionIds()) {
+        liveDaemonSessionIds.add(id)
+      }
+    }
+    await runOrphanHistoryReaper({
+      historyBasePath: getHistoryDir(),
+      sidecarDir: app.getPath('userData'),
+      workspaceSession: store.getWorkspaceSession(),
+      liveDaemonSessionIds
+    })
+  } catch (error) {
+    console.warn('[history-reaper] startup pass failed:', error)
   }
   setAppRuntimeFlags({
     agentDashboardEnabledAtStartup: agentDashboardEnabled

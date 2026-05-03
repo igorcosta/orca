@@ -48,7 +48,10 @@ function getRuntimeDir(): string {
   return dir
 }
 
-function getHistoryDir(): string {
+// Why: exported so the orphan-history-reaper (a sibling pass run after daemon
+// init in src/main/index.ts) can enumerate `terminal-history/<encodedId>/`
+// directories without duplicating the path-derivation logic.
+export function getHistoryDir(): string {
   const dir = join(app.getPath('userData'), 'terminal-history')
   mkdirSync(dir, { recursive: true })
   return dir
