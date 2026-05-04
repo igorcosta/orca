@@ -29,6 +29,13 @@ export const AGENT_CATALOG: AgentCatalogEntry[] = [
     homepageUrl: 'https://github.com/openai/codex'
   },
   {
+    id: 'autohand',
+    label: 'Autohand Code',
+    cmd: 'autohand',
+    faviconDomain: 'autohand.ai',
+    homepageUrl: 'https://github.com/autohandai/code-cli'
+  },
+  {
     id: 'copilot',
     label: 'GitHub Copilot',
     cmd: 'copilot',

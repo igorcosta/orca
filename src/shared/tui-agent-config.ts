@@ -33,6 +33,12 @@ export const TUI_AGENT_CONFIG: Record<TuiAgent, TuiAgentConfig> = {
     expectedProcess: 'codex',
     promptInjectionMode: 'argv'
   },
+  autohand: {
+    detectCmd: 'autohand',
+    launchCmd: 'autohand',
+    expectedProcess: 'autohand',
+    promptInjectionMode: 'stdin-after-start'
+  },
   opencode: {
     detectCmd: 'opencode',
     launchCmd: 'opencode',
